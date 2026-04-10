@@ -123,7 +123,9 @@ function StatusCell({ visible }) {
 function Dashboard() {
   const [wsStatus, setWsStatus] = useState("disconnected");
   const [frameData, setFrameData] = useState(null);
+  const [feedAlive, setFeedAlive] = useState(false);
   const canvasRef = useRef(null);
+  const lastJpegTsRef = useRef(0);
 
   useEffect(() => {
     let ws = null;
@@ -155,6 +157,8 @@ function Dashboard() {
 
   useEffect(() => {
     if (!frameData || !frameData.frame_jpeg_b64 || !canvasRef.current) return;
+    lastJpegTsRef.current = Date.now();
+    setFeedAlive(true);
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
     const img = new Image();
@@ -163,6 +167,15 @@ function Dashboard() {
     };
     img.src = "data:image/jpeg;base64," + frameData.frame_jpeg_b64;
   }, [frameData]);
+
+  useEffect(() => {
+    const staleMs = 1500;
+    const id = setInterval(() => {
+      if (lastJpegTsRef.current === 0) return;
+      if (Date.now() - lastJpegTsRef.current > staleMs) setFeedAlive(false);
+    }, 500);
+    return () => clearInterval(id);
+  }, []);
 
   const forearmVis = frameData?.forearm?.visible;
   const wristVis = frameData?.wrist?.visible;
@@ -180,8 +193,6 @@ function Dashboard() {
   const handState = frameData && typeof frameData.hand?.is_open === "boolean"
     ? (frameData.hand.is_open ? "Open" : "Closed") : "-";
 
-  const hasFrame = !!(frameData && frameData.frame_jpeg_b64);
-
   return (
     <div className="page">
       <div className="accent-bar"></div>
@@ -192,9 +203,13 @@ function Dashboard() {
       </div>
 
       <div className="video-card">
-        {hasFrame
-          ? <canvas ref={canvasRef} width="960" height="540" />
-          : <div className="video-placeholder">Waiting for camera feed...</div>}
+        <canvas
+          ref={canvasRef}
+          width="960"
+          height="540"
+          style={{ display: feedAlive ? "block" : "none" }}
+        />
+        {!feedAlive && <div className="video-placeholder">Waiting for camera feed...</div>}
       </div>
 
       <div className="stats-card">
