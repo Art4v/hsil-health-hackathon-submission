@@ -59,12 +59,10 @@ MODELS_DIR = ensure_models(os.path.join(SCRIPT_DIR, "models"))
 # BlazePose full-body indices for the 6 upper-body joints we care about.
 # These indices are stable across MediaPipe releases.
 POSE_IDX = {
-    "LEFT_SHOULDER":  11,
-    "RIGHT_SHOULDER": 12,
-    "LEFT_ELBOW":     13,
-    "RIGHT_ELBOW":    14,
-    "LEFT_WRIST":     15,
-    "RIGHT_WRIST":    16,
+    "LEFT_ELBOW":  13,
+    "RIGHT_ELBOW": 14,
+    "LEFT_WRIST":  15,
+    "RIGHT_WRIST": 16,
 }
 
 # MediaPipe Hands 21-landmark model indices
@@ -247,16 +245,16 @@ while cap.isOpened():
         MP_SIDE = "LEFT"          # MediaPipe landmark key (in mirrored frame)
         DISPLAY_SIDE = "RIGHT"    # What we show to the user
 
-        # Still gate on visibility — if the tracked arm isn't in frame, draw nothing.
+        # Still gate on visibility — if the forearm isn't in frame, draw nothing.
         VIS_THRESHOLD = 0.6
         tracked_visible = all(
             pose_lm[POSE_IDX[f"{MP_SIDE}_{joint}"]].visibility >= VIS_THRESHOLD
-            for joint in ("SHOULDER", "ELBOW", "WRIST")
+            for joint in ("ELBOW", "WRIST")
         )
 
         if tracked_visible:
             # Draw a labelled dot at each tracked joint
-            for joint in ("SHOULDER", "ELBOW", "WRIST"):
+            for joint in ("ELBOW", "WRIST"):
                 idx = POSE_IDX[f"{MP_SIDE}_{joint}"]
                 lx = int(pose_lm[idx].x * w)  # landmarks are normalised 0-1, scale to pixels
                 ly = int(pose_lm[idx].y * h)
@@ -264,32 +262,26 @@ while cap.isOpened():
                 cv2.putText(frame, f"{DISPLAY_SIDE}_{joint}", (lx + 10, ly),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 128), 1)
 
-            # Connect shoulder -> elbow -> wrist as a polyline
+            # Connect elbow -> wrist as a line (the forearm)
             pts = []
-            for joint in ("SHOULDER", "ELBOW", "WRIST"):
+            for joint in ("ELBOW", "WRIST"):
                 idx = POSE_IDX[f"{MP_SIDE}_{joint}"]
                 pts.append((int(pose_lm[idx].x * w), int(pose_lm[idx].y * h)))
             cv2.polylines(frame, [np.array(pts)], False, (0, 200, 100), 2)
 
             '''
-            FOR ANGLE CALCULATION OF ARM
+            FOR ANGLE CALCULATION OF FOREARM
             '''
 
-            # Unpack the 3 pixel coords for angle calculations
-            shoulder_px, elbow_px, wrist_px = pts
-
-            # Elbow flexion angle — angle at elbow between upper arm and forearm
-            # 180° = fully straight, smaller = more bent
-            elbow_angle = angle_between(shoulder_px, elbow_px, wrist_px)
+            # Unpack the 2 pixel coords for angle calculation
+            elbow_px, wrist_px = pts
 
             # Forearm elevation — how far the forearm is tilted above horizontal
             # Uses elbow->wrist vector vs the table plane (horizontal in image space)
             forearm_elev = elevation_angle(elbow_px, wrist_px)
 
-            # Display both angles near the elbow joint
+            # Display forearm elevation near the elbow joint
             ex, ey = elbow_px
-            cv2.putText(frame, f"Flex: {elbow_angle:.1f}deg",
-                        (ex + 10, ey - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
             cv2.putText(frame, f"Elev: {forearm_elev:.1f}deg",
                         (ex + 10, ey + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
 
@@ -353,9 +345,15 @@ while cap.isOpened():
                 mid_mcp = hand_lm[MIDDLE_FINGER_MCP]
                 mid_mcp_px = (int(mid_mcp.x * w), int(mid_mcp.y * h))
 
-                # Angle at wrist: how much the hand deviates from the forearm direction
-                # 180° = hand perfectly aligned with forearm, smaller = wrist is bent
-                wrist_bend = angle_between(elbow_px, wrist_px, mid_mcp_px)
+                # Wrist bend via signed deviation of hand direction from forearm direction.
+                # atan2(cross, dot) gives 0° when straight, ±90° when fully bent.
+                # We remap: 0° deviation → 180° displayed, 90° deviation → 90° displayed.
+                forearm_vec = np.array(wrist_px, dtype=float) - np.array(elbow_px, dtype=float)
+                hand_vec    = np.array(mid_mcp_px, dtype=float) - np.array(wrist_px, dtype=float)
+                cross = forearm_vec[0] * hand_vec[1] - forearm_vec[1] * hand_vec[0]
+                dot   = forearm_vec[0] * hand_vec[0] + forearm_vec[1] * hand_vec[1]
+                deviation_deg = abs(np.degrees(np.arctan2(cross, dot)))
+                wrist_bend = max(0.0, min(180.0, 180.0 - deviation_deg))
 
                 cv2.putText(frame, f"Wrist bend: {wrist_bend:.1f}deg",
                             (wx, wy + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
