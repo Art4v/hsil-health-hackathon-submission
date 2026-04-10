@@ -9,6 +9,7 @@ FastAPI bridge between the MediaPipe CV process and downstream consumers.
 
 import asyncio
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -18,6 +19,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("server-control")
 
 app = FastAPI(title="server-control")
+
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+DASHBOARD_PATH = FRONTEND_DIR / "dashboard.html"
 
 # Latest frame payload pushed by the CV producer. None when no producer connected.
 latest_state: dict | None = None
@@ -81,6 +85,11 @@ connect();
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return INDEX_HTML
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    return DASHBOARD_PATH.read_text(encoding="utf-8")
 
 
 @app.get("/health")

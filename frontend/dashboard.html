@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Remote Surgical Training Arm</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  body {
+    margin: 0;
+    background: #ffffff;
+    color: #1a1a1a;
+    font-family: system-ui, -apple-system, sans-serif;
+  }
+  .page {
+    max-width: 1024px;
+    margin: 0 auto;
+    padding: 24px;
+  }
+  .accent-bar {
+    width: 48px;
+    height: 4px;
+    background: #dc2626;
+    margin-bottom: 8px;
+  }
+  h1 {
+    font-weight: 700;
+    margin: 0 0 12px 0;
+  }
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+  .status-dot.connected { background: #16a34a; }
+  .status-dot.disconnected { background: #dc2626; }
+  .video-card {
+    width: 960px;
+    max-width: 100%;
+    height: 540px;
+    border: 1px solid #e5e5e5;
+    border-radius: 8px;
+    overflow: hidden;
+    margin: 0 auto;
+    background: #1a1a1a;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .video-card canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  .video-placeholder {
+    color: #e5e5e5;
+    font-size: 16px;
+  }
+  .stats-card {
+    margin-top: 16px;
+    border: 1px solid #e5e5e5;
+    border-radius: 8px;
+    background: #ffffff;
+    overflow: hidden;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th {
+    text-align: left;
+    padding: 12px 16px;
+    border-bottom: 2px solid #dc2626;
+    font-weight: 600;
+  }
+  td {
+    padding: 12px 16px;
+    border-bottom: 1px solid #e5e5e5;
+  }
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+  .vis-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .vis-dot.on { background: #16a34a; }
+  .vis-dot.off { background: #dc2626; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+function fmt1(n) {
+  return (typeof n === "number") ? n.toFixed(1) : "-";
+}
+
+function StatusCell({ visible }) {
+  if (typeof visible !== "boolean") return <span>-</span>;
+  return (
+    <span>
+      <span className={"vis-dot " + (visible ? "on" : "off")}></span>
+      {visible ? "visible" : "not visible"}
+    </span>
+  );
+}
+
+function Dashboard() {
+  const [wsStatus, setWsStatus] = useState("disconnected");
+  const [frameData, setFrameData] = useState(null);
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    let ws = null;
+    let closed = false;
+    let retryTimer = null;
+
+    function connect() {
+      ws = new WebSocket("ws://" + location.host + "/ws/stream");
+      ws.onopen = () => setWsStatus("connected");
+      ws.onclose = () => {
+        setWsStatus("disconnected");
+        if (!closed) retryTimer = setTimeout(connect, 1000);
+      };
+      ws.onerror = () => {
+        try { ws.close(); } catch (e) {}
+      };
+      ws.onmessage = (ev) => {
+        try { setFrameData(JSON.parse(ev.data)); } catch (e) {}
+      };
+    }
+    connect();
+
+    return () => {
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (ws) { try { ws.close(); } catch (e) {} }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!frameData || !frameData.frame_jpeg_b64 || !canvasRef.current) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    const img = new Image();
+    img.onload = () => {
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    };
+    img.src = "data:image/jpeg;base64," + frameData.frame_jpeg_b64;
+  }, [frameData]);
+
+  const forearmVis = frameData?.forearm?.visible;
+  const wristVis = frameData?.wrist?.visible;
+  const handVis = frameData?.hand?.visible;
+
+  const elevation = frameData && typeof frameData.forearm?.elevation_deg === "number"
+    ? fmt1(frameData.forearm.elevation_deg) + "\u00b0" : "-";
+  const yaw = frameData && typeof frameData.forearm?.yaw_deg === "number"
+    ? fmt1(frameData.forearm.yaw_deg) + "\u00b0" : "-";
+  const bend = frameData && typeof frameData.wrist?.bend_deg === "number"
+    ? fmt1(frameData.wrist.bend_deg) + "\u00b0" : "-";
+  const side = frameData?.hand?.side ?? "-";
+  const openness = frameData && typeof frameData.hand?.openness_pct === "number"
+    ? (frameData.hand.openness_pct * 100).toFixed(1) + "%" : "-";
+  const handState = frameData && typeof frameData.hand?.is_open === "boolean"
+    ? (frameData.hand.is_open ? "Open" : "Closed") : "-";
+
+  const hasFrame = !!(frameData && frameData.frame_jpeg_b64);
+
+  return (
+    <div className="page">
+      <div className="accent-bar"></div>
+      <h1>Remote Surgical Training Arm</h1>
+      <div className="status-row">
+        <span className={"status-dot " + wsStatus}></span>
+        <span>{wsStatus === "connected" ? "Connected" : "Disconnected"}</span>
+      </div>
+
+      <div className="video-card">
+        {hasFrame
+          ? <canvas ref={canvasRef} width="960" height="540" />
+          : <div className="video-placeholder">Waiting for camera feed...</div>}
+      </div>
+
+      <div className="stats-card">
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>Value</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Forearm Elevation</td>
+              <td>{elevation}</td>
+              <td><StatusCell visible={forearmVis} /></td>
+            </tr>
+            <tr>
+              <td>Forearm Yaw</td>
+              <td>{yaw}</td>
+              <td><StatusCell visible={forearmVis} /></td>
+            </tr>
+            <tr>
+              <td>Wrist Bend</td>
+              <td>{bend}</td>
+              <td><StatusCell visible={wristVis} /></td>
+            </tr>
+            <tr>
+              <td>Hand Side</td>
+              <td>{side}</td>
+              <td><StatusCell visible={handVis} /></td>
+            </tr>
+            <tr>
+              <td>Hand Openness</td>
+              <td>{openness}</td>
+              <td><StatusCell visible={handVis} /></td>
+            </tr>
+            <tr>
+              <td>Hand State</td>
+              <td>{handState}</td>
+              <td><StatusCell visible={handVis} /></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Dashboard />);
+</script>
+</body>
+</html>

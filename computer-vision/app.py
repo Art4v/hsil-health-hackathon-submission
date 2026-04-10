@@ -1,6 +1,7 @@
 # Library imports
 import argparse
 import asyncio
+import base64
 import json
 import os
 import queue
@@ -98,6 +99,11 @@ OPENNESS_MIN_RATIO = 0.65   # ratio at which we call it 0%
 OPENNESS_MAX_RATIO = 1.35   # ratio at which we call it 100%
 OPEN_THRESHOLD     = 0.5    # ≥50% openness → "Open"
 
+# Annotated-frame streaming to the dashboard. JPEG encode + base64 is expensive,
+# so we cap the cadence — the stats table still updates at full CV rate.
+DASHBOARD_FPS = 15
+_last_frame_send_ms = 0
+
 # Edge list for drawing the 21-landmark hand skeleton
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),            # thumb
@@ -175,7 +181,7 @@ def draw_hand_skeleton(frame, hand_landmarks, color):
 # -----------------------------------------------------------------------------
 
 def build_frame_payload(ts_ms, forearm_elev, forearm_yaw, wrist_bend,
-                        hand_side, hand_pct, hand_is_open):
+                        hand_side, hand_pct, hand_is_open, frame_b64=None):
     """Assemble the JSON payload for one CV frame (see server-control/README.md)."""
     forearm = {"visible": forearm_elev is not None}
     if forearm_elev is not None:
@@ -193,12 +199,15 @@ def build_frame_payload(ts_ms, forearm_elev, forearm_yaw, wrist_bend,
         hand["openness_pct"] = float(hand_pct)
         hand["is_open"] = bool(hand_is_open)
 
-    return {
+    payload = {
         "ts_ms": int(ts_ms),
         "forearm": forearm,
         "wrist": wrist,
         "hand": hand,
     }
+    if frame_b64 is not None:
+        payload["frame_jpeg_b64"] = frame_b64
+    return payload
 
 
 class FramePusher:
@@ -507,14 +516,23 @@ while cap.isOpened():
 
     # Push this frame's measurements out to server-control (if enabled).
     if pusher is not None:
+        frame_b64 = None
+        current_ms = (time.monotonic_ns() - start_ns) // 1_000_000
+        if current_ms - _last_frame_send_ms >= (1000 // DASHBOARD_FPS):
+            ok, jpeg_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                frame_b64 = base64.b64encode(jpeg_buf).decode('ascii')
+                _last_frame_send_ms = current_ms
+
         payload = build_frame_payload(
-            ts_ms=(time.monotonic_ns() - start_ns) // 1_000_000,
+            ts_ms=current_ms,
             forearm_elev=frame_forearm_elev,
             forearm_yaw=frame_forearm_yaw,
             wrist_bend=frame_wrist_bend,
             hand_side=frame_hand_side,
             hand_pct=frame_hand_pct,
             hand_is_open=frame_hand_open,
+            frame_b64=frame_b64,
         )
         pusher.push(payload)
 
