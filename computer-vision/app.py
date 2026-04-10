@@ -1,12 +1,15 @@
 # Library imports
 import argparse
 import asyncio
+import base64
 import json
 import os
 import queue
 import threading
 import time
 import urllib.request
+
+from collections import deque
 
 import cv2
 import mediapipe as mp
@@ -33,6 +36,8 @@ parser.add_argument("--server_url", type=str,
                     help="server-control ingest websocket URL")
 parser.add_argument("--no_server", action="store_true",
                     help="Disable pushing frames to server-control")
+parser.add_argument("--smoothing_ms", type=int, default=1000,
+                    help="Rolling-window length (ms) for smoothing angle/openness signals")
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -86,17 +91,25 @@ FINGER_TIPS = [INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
 FINGER_PIPS = [INDEX_PIP, MIDDLE_PIP, RING_PIP, PINKY_PIP]
 
 # Forearm yaw: horizontal sweep derived from elbow->wrist x/z. Clamped to the
-# base yaw servo's mechanical range, and EMA-smoothed because monocular depth
-# (MediaPipe .z) is noisy.
+# base yaw servo's mechanical range. Monocular depth (MediaPipe .z) is noisy,
+# so smoothing happens downstream via the shared rolling-window smoother.
 YAW_LIMIT_DEG = 80.0
-YAW_EMA_ALPHA = 0.3
-_forearm_yaw_ema = None
 
 # Hand openness: linear map from avg wrist-tip/wrist-pip ratio → [0, 1].
 # Thumb is deliberately excluded because it moves laterally and biases the score.
 OPENNESS_MIN_RATIO = 0.65   # ratio at which we call it 0%
 OPENNESS_MAX_RATIO = 1.35   # ratio at which we call it 100%
-OPEN_THRESHOLD     = 0.5    # ≥50% openness → "Open"
+
+# Hand-open hysteresis. Two-sided band kills the boundary flicker you get
+# from a single threshold when the smoothed pct sits right at 50%.
+OPEN_ENTER = 0.55   # closed → open when smoothed pct crosses upward
+OPEN_EXIT  = 0.45   # open → closed when smoothed pct crosses downward
+_hand_is_open_state = False
+
+# Annotated-frame streaming to the dashboard. JPEG encode + base64 is expensive,
+# so we cap the cadence — the stats table still updates at full CV rate.
+DASHBOARD_FPS = 15
+_last_frame_send_ms = 0
 
 # Edge list for drawing the 21-landmark hand skeleton
 HAND_CONNECTIONS = [
@@ -117,7 +130,8 @@ def hand_openness(lm):
     Continuous openness score in [0.0, 1.0] based on how far each fingertip
     is from the wrist relative to its PIP joint. Scale-invariant (pure ratio).
     Thumb is excluded — it moves laterally and biases the score.
-    Returns (pct, is_open).
+    Returns pct. Open/closed state is derived downstream from the smoothed
+    pct with hysteresis.
     """
     wrist = np.array([lm[HAND_WRIST].x, lm[HAND_WRIST].y])
     ratios = []
@@ -131,12 +145,45 @@ def hand_openness(lm):
         ratios.append(d_tip / d_pip)
 
     if not ratios:
-        return 0.0, False
+        return 0.0
 
     avg = sum(ratios) / len(ratios)
     pct = (avg - OPENNESS_MIN_RATIO) / (OPENNESS_MAX_RATIO - OPENNESS_MIN_RATIO)
-    pct = max(0.0, min(1.0, pct))
-    return pct, pct >= OPEN_THRESHOLD
+    return max(0.0, min(1.0, pct))
+
+
+# -----------------------------------------------------------------------------
+# ROLLING-WINDOW SMOOTHER
+# -----------------------------------------------------------------------------
+
+class WindowedMean:
+    """Rolling mean over a fixed time window in milliseconds.
+
+    Samples outside the window are dropped on each `add`, so if a signal
+    goes invisible for longer than the window the smoother naturally
+    drains and does not emit stale pre-occlusion data.
+    """
+
+    def __init__(self, window_ms):
+        self.window_ms = window_ms
+        self.samples: "deque[tuple[int, float]]" = deque()
+
+    def add(self, ts_ms, value):
+        self.samples.append((ts_ms, value))
+        cutoff = ts_ms - self.window_ms
+        while self.samples and self.samples[0][0] < cutoff:
+            self.samples.popleft()
+
+    def value(self):
+        if not self.samples:
+            return None
+        return sum(v for _, v in self.samples) / len(self.samples)
+
+
+elev_smoother  = WindowedMean(args.smoothing_ms)
+yaw_smoother   = WindowedMean(args.smoothing_ms)
+wrist_smoother = WindowedMean(args.smoothing_ms)
+hand_smoother  = WindowedMean(args.smoothing_ms)
 
 
 # -----------------------------------------------------------------------------
@@ -175,17 +222,17 @@ def draw_hand_skeleton(frame, hand_landmarks, color):
 # -----------------------------------------------------------------------------
 
 def build_frame_payload(ts_ms, forearm_elev, forearm_yaw, wrist_bend,
-                        hand_side, hand_pct, hand_is_open):
+                        hand_side, hand_pct, hand_is_open, frame_b64=None):
     """Assemble the JSON payload for one CV frame (see server-control/README.md)."""
     forearm = {"visible": forearm_elev is not None}
     if forearm_elev is not None:
-        forearm["elevation_deg"] = int(round(forearm_elev / 5.0)) * 5
+        forearm["elevation_deg"] = round(float(forearm_elev), 2)
     if forearm_yaw is not None:
-        forearm["yaw_deg"] = int(round(forearm_yaw / 5.0)) * 5
+        forearm["yaw_deg"] = round(float(forearm_yaw), 2)
 
     wrist = {"visible": wrist_bend is not None}
     if wrist_bend is not None:
-        wrist["bend_deg"] = int(round(wrist_bend / 5.0)) * 5
+        wrist["bend_deg"] = round(float(wrist_bend), 2)
 
     hand = {"visible": hand_side is not None}
     if hand_side is not None:
@@ -193,12 +240,15 @@ def build_frame_payload(ts_ms, forearm_elev, forearm_yaw, wrist_bend,
         hand["openness_pct"] = float(hand_pct)
         hand["is_open"] = bool(hand_is_open)
 
-    return {
+    payload = {
         "ts_ms": int(ts_ms),
         "forearm": forearm,
         "wrist": wrist,
         "hand": hand,
     }
+    if frame_b64 is not None:
+        payload["frame_jpeg_b64"] = frame_b64
+    return payload
 
 
 class FramePusher:
@@ -350,15 +400,18 @@ while cap.isOpened():
     frame = cv2.flip(frame, 1)
     h, w = frame.shape[:2]
 
+    # Monotonic frame clock — used both as MediaPipe's VIDEO-mode timestamp and
+    # as the key into our rolling-window smoothers.
+    current_ms = (time.monotonic_ns() - start_ns) // 1_000_000
+
     # MediaPipe Tasks API expects an mp.Image wrapping an RGB ndarray
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
     # Run both landmarkers on the same frame
     if running_mode == VisionRunningMode.VIDEO:
-        timestamp_ms = (time.monotonic_ns() - start_ns) // 1_000_000
-        pose_results = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-        hands_results = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
+        pose_results = pose_landmarker.detect_for_video(mp_image, current_ms)
+        hands_results = hand_landmarker.detect_for_video(mp_image, current_ms)
     else:
         pose_results = pose_landmarker.detect(mp_image)
         hands_results = hand_landmarker.detect(mp_image)
@@ -424,8 +477,9 @@ while cap.isOpened():
 
             # Forearm elevation — how far the forearm is tilted above horizontal
             # Uses elbow->wrist vector vs the table plane (horizontal in image space)
-            forearm_elev = elevation_angle(elbow_px, wrist_px)
-            frame_forearm_elev = forearm_elev
+            raw_elev = elevation_angle(elbow_px, wrist_px)
+            elev_smoother.add(current_ms, raw_elev)
+            frame_forearm_elev = elev_smoother.value()
 
             # Forearm yaw — horizontal sweep of the elbow->wrist vector. Uses raw
             # normalised landmark coords because MediaPipe .z (depth relative to
@@ -436,23 +490,19 @@ while cap.isOpened():
             dx = wrist_lm.x - elbow_lm.x
             dz = wrist_lm.z - elbow_lm.z
             raw_yaw = np.degrees(np.arctan2(dx, -dz))
+            # Offset so 0° = arm horizontal to camera (not pointing at it).
+            raw_yaw = ((raw_yaw - 90.0 + 180.0) % 360.0) - 140.0
             raw_yaw = max(-YAW_LIMIT_DEG, min(YAW_LIMIT_DEG, raw_yaw))
 
-            if _forearm_yaw_ema is None:
-                _forearm_yaw_ema = raw_yaw
-            else:
-                _forearm_yaw_ema = (
-                    YAW_EMA_ALPHA * raw_yaw
-                    + (1.0 - YAW_EMA_ALPHA) * _forearm_yaw_ema
-                )
-            forearm_yaw = _forearm_yaw_ema
-            frame_forearm_yaw = forearm_yaw
+            yaw_smoother.add(current_ms, raw_yaw)
+            frame_forearm_yaw = yaw_smoother.value()
 
-            # Display forearm elevation near the elbow joint
+            # Display smoothed values near the elbow joint so the preview
+            # matches what gets pushed to the server.
             ex, ey = elbow_px
-            cv2.putText(frame, f"Elev: {forearm_elev:.1f}deg",
+            cv2.putText(frame, f"Elev: {frame_forearm_elev:.1f}deg",
                         (ex + 10, ey + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
-            cv2.putText(frame, f"Yaw: {forearm_yaw:.1f}deg",
+            cv2.putText(frame, f"Yaw: {frame_forearm_yaw:.1f}deg",
                         (ex + 10, ey + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
 
             # Save wrist position in normalised coords for hand matching below.
@@ -474,12 +524,27 @@ while cap.isOpened():
             raw_label = handedness[0].category_name  # "Left" or "Right"
             label = "Right" if raw_label == "Left" else "Left"
 
-            pct, is_open = hand_openness(hand_lm)
+            raw_pct = hand_openness(hand_lm)
+            hand_smoother.add(current_ms, raw_pct)
+            smoothed_pct = hand_smoother.value()
+            if smoothed_pct is None:
+                smoothed_pct = raw_pct
+
+            # Two-sided hysteresis on the smoothed pct: only flip the boolean
+            # when the value clearly crosses one of the thresholds.
+            if _hand_is_open_state:
+                if smoothed_pct <= OPEN_EXIT:
+                    _hand_is_open_state = False
+            else:
+                if smoothed_pct >= OPEN_ENTER:
+                    _hand_is_open_state = True
+
+            is_open = _hand_is_open_state
             state = "Open" if is_open else "Closed"
             color = (0, 255, 0) if is_open else (0, 0, 255)
 
             frame_hand_side = label
-            frame_hand_pct  = pct
+            frame_hand_pct  = smoothed_pct
             frame_hand_open = is_open
 
             # Draw the 21-landmark hand skeleton
@@ -489,8 +554,8 @@ while cap.isOpened():
             wrist = hand_lm[HAND_WRIST]
             wx, wy = int(wrist.x * w), int(wrist.y * h)
 
-            # Show hand side, binary state, and continuous openness percentage
-            cv2.putText(frame, f"{label}: {state} {pct * 100:.2f}%",
+            # Show hand side, binary state, and smoothed openness percentage
+            cv2.putText(frame, f"{label}: {state} {smoothed_pct * 100:.2f}%",
                         (wx, wy - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             # Wrist angle relative to horizontal: elevation of the hand vector
@@ -499,22 +564,31 @@ while cap.isOpened():
             mid_mcp_px = (int(mid_mcp.x * w), int(mid_mcp.y * h))
             wrist_px = (wx, wy)
 
-            wrist_bend = elevation_angle(wrist_px, mid_mcp_px)
-            frame_wrist_bend = wrist_bend
+            raw_wrist_bend = elevation_angle(wrist_px, mid_mcp_px)
+            wrist_smoother.add(current_ms, raw_wrist_bend)
+            frame_wrist_bend = wrist_smoother.value()
 
-            cv2.putText(frame, f"Wrist angle: {wrist_bend:.1f}deg",
+            cv2.putText(frame, f"Wrist angle: {frame_wrist_bend:.1f}deg",
                         (wx, wy + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
 
     # Push this frame's measurements out to server-control (if enabled).
     if pusher is not None:
+        frame_b64 = None
+        if current_ms - _last_frame_send_ms >= (1000 // DASHBOARD_FPS):
+            ok, jpeg_buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                frame_b64 = base64.b64encode(jpeg_buf).decode('ascii')
+                _last_frame_send_ms = current_ms
+
         payload = build_frame_payload(
-            ts_ms=(time.monotonic_ns() - start_ns) // 1_000_000,
+            ts_ms=current_ms,
             forearm_elev=frame_forearm_elev,
             forearm_yaw=frame_forearm_yaw,
             wrist_bend=frame_wrist_bend,
             hand_side=frame_hand_side,
             hand_pct=frame_hand_pct,
             hand_is_open=frame_hand_open,
+            frame_b64=frame_b64,
         )
         pusher.push(payload)
 
