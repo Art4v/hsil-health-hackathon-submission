@@ -32,28 +32,32 @@ SHOULDER_PWM_MIN = 640
 SHOULDER_PWM_MAX = 2000
 SHOULDER_PWM_NEUTRAL = 1300
 
-# YM2758 (SG90): standard ~500–2400 µs
-NEEDLE_PWM_MIN = 500
+# YM2758 (SG90): ~544–2400 µs (500 µs causes jitter at the range edge)
+NEEDLE_PWM_MIN = 544
 NEEDLE_PWM_MAX = 2400
-NEEDLE_PWM_NEUTRAL = 500  # 0° = fully retracted
+NEEDLE_PWM_NEUTRAL = 544  # 0° = fully retracted
 
 # ─── Angle Limits (degrees, from hardware design report) ─────────────────────
 BASE_ANGLE_MIN = -80.0    # full left
 BASE_ANGLE_MAX = 80.0     # full right
 BASE_ANGLE_HOME = 0.0     # center
 
-SHOULDER_ANGLE_MIN = -60.0  # max downward pitch
+SHOULDER_ANGLE_MIN = -20.0  # max downward pitch
 SHOULDER_ANGLE_MAX = 0.0    # horizontal
 SHOULDER_ANGLE_HOME = 0.0   # horizontal
+SHOULDER_PHYSICAL_MIN = -60.0  # full mechanical range min
+SHOULDER_PHYSICAL_MAX = 0.0    # full mechanical range max
 
 NEEDLE_ANGLE_MIN = 0.0     # retracted
-NEEDLE_ANGLE_MAX = 60.0    # extended
+NEEDLE_ANGLE_MAX = 15.0    # extended
 NEEDLE_ANGLE_HOME = 0.0    # retracted
+NEEDLE_PHYSICAL_MIN = 0.0     # full mechanical range min
+NEEDLE_PHYSICAL_MAX = 60.0    # full mechanical range max
 
 # ─── Velocity Settings ───────────────────────────────────────────────────────
-VELOCITY_MIN = 5.0          # degrees per second
-VELOCITY_MAX = 30.0         # degrees per second (safety cap from design report)
-VELOCITY_DEFAULT = 15.0     # starting velocity
+VELOCITY_MIN = 10.0          # degrees per second
+VELOCITY_MAX = 60.0         # degrees per second (safety cap from design report)
+VELOCITY_DEFAULT = 30.0     # starting velocity
 VELOCITY_STEP = 5.0         # increment per keypress
 
 # ─── Loop Timing ──────────────────────────────────────────────────────────────
@@ -105,10 +109,10 @@ def main(stdscr):
     pi.set_servo_pulsewidth(BASE_PIN, angle_to_pwm(
         base_angle, BASE_ANGLE_MIN, BASE_ANGLE_MAX, BASE_PWM_MIN, BASE_PWM_MAX))
     pi.set_servo_pulsewidth(SHOULDER_PIN, angle_to_pwm(
-        shoulder_angle, SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX,
+        shoulder_angle, SHOULDER_PHYSICAL_MIN, SHOULDER_PHYSICAL_MAX,
         SHOULDER_PWM_MIN, SHOULDER_PWM_MAX))
     pi.set_servo_pulsewidth(NEEDLE_PIN, angle_to_pwm(
-        needle_angle, NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX,
+        needle_angle, NEEDLE_PHYSICAL_MIN, NEEDLE_PHYSICAL_MAX,
         NEEDLE_PWM_MIN, NEEDLE_PWM_MAX))
 
     try:
@@ -175,11 +179,11 @@ def main(stdscr):
             # ── Write PWM ─────────────────────────────────────────────────
             base_pwm = angle_to_pwm(base_angle, BASE_ANGLE_MIN,
                                      BASE_ANGLE_MAX, BASE_PWM_MIN, BASE_PWM_MAX)
-            shoulder_pwm = angle_to_pwm(shoulder_angle, SHOULDER_ANGLE_MIN,
-                                         SHOULDER_ANGLE_MAX, SHOULDER_PWM_MIN,
+            shoulder_pwm = angle_to_pwm(shoulder_angle, SHOULDER_PHYSICAL_MIN,
+                                         SHOULDER_PHYSICAL_MAX, SHOULDER_PWM_MIN,
                                          SHOULDER_PWM_MAX)
-            needle_pwm = angle_to_pwm(needle_angle, NEEDLE_ANGLE_MIN,
-                                       NEEDLE_ANGLE_MAX, NEEDLE_PWM_MIN,
+            needle_pwm = angle_to_pwm(needle_angle, NEEDLE_PHYSICAL_MIN,
+                                       NEEDLE_PHYSICAL_MAX, NEEDLE_PWM_MIN,
                                        NEEDLE_PWM_MAX)
 
             pi.set_servo_pulsewidth(BASE_PIN, base_pwm)

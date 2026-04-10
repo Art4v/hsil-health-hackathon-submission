@@ -35,18 +35,22 @@ BASE_PWM_MAX = 2000
 SHOULDER_PWM_MIN = 640
 SHOULDER_PWM_MAX = 2000
 
-NEEDLE_PWM_MIN = 500
+NEEDLE_PWM_MIN = 544
 NEEDLE_PWM_MAX = 2400
 
 # ─── Angle Limits (degrees, from hardware design report) ─────────────────────
 BASE_ANGLE_MIN = -80.0
 BASE_ANGLE_MAX = 80.0
 
-SHOULDER_ANGLE_MIN = -60.0
+SHOULDER_ANGLE_MIN = -20.0
 SHOULDER_ANGLE_MAX = 0.0
+SHOULDER_PHYSICAL_MIN = -60.0  # full mechanical range min
+SHOULDER_PHYSICAL_MAX = 0.0    # full mechanical range max
 
 NEEDLE_ANGLE_MIN = 0.0
-NEEDLE_ANGLE_MAX = 60.0
+NEEDLE_ANGLE_MAX = 15.0
+NEEDLE_PHYSICAL_MIN = 0.0     # full mechanical range min
+NEEDLE_PHYSICAL_MAX = 60.0    # full mechanical range max
 
 # ─── Zone Classification Thresholds ──────────────────────────────────────────
 # Percentage of range from the limit at which we enter amber/red zones
@@ -126,12 +130,12 @@ class ServoController:
         )
         self.pi.set_servo_pulsewidth(
             SHOULDER_PIN,
-            angle_to_pwm(self.pitch, SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX,
+            angle_to_pwm(self.pitch, SHOULDER_PHYSICAL_MIN, SHOULDER_PHYSICAL_MAX,
                           SHOULDER_PWM_MIN, SHOULDER_PWM_MAX)
         )
         self.pi.set_servo_pulsewidth(
             NEEDLE_PIN,
-            angle_to_pwm(self.needle, NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX,
+            angle_to_pwm(self.needle, NEEDLE_PHYSICAL_MIN, NEEDLE_PHYSICAL_MAX,
                           NEEDLE_PWM_MIN, NEEDLE_PWM_MAX)
         )
 
