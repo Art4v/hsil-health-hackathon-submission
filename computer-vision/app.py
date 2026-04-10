@@ -69,8 +69,6 @@ POSE_IDX = {
 
 # MediaPipe Hands 21-landmark model indices
 HAND_WRIST = 0
-THUMB_TIP = 4
-THUMB_IP  = 3
 INDEX_TIP, INDEX_PIP   = 8, 6
 MIDDLE_TIP, MIDDLE_PIP = 12, 10
 RING_TIP, RING_PIP     = 16, 14
@@ -79,6 +77,12 @@ MIDDLE_FINGER_MCP = 9
 
 FINGER_TIPS = [INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
 FINGER_PIPS = [INDEX_PIP, MIDDLE_PIP, RING_PIP, PINKY_PIP]
+
+# Hand openness: linear map from avg wrist-tip/wrist-pip ratio → [0, 1].
+# Thumb is deliberately excluded because it moves laterally and biases the score.
+OPENNESS_MIN_RATIO = 0.65   # ratio at which we call it 0%
+OPENNESS_MAX_RATIO = 1.35   # ratio at which we call it 100%
+OPEN_THRESHOLD     = 0.5    # ≥50% openness → "Open"
 
 # Edge list for drawing the 21-landmark hand skeleton
 HAND_CONNECTIONS = [
@@ -91,50 +95,34 @@ HAND_CONNECTIONS = [
 ]
 
 # -----------------------------------------------------------------------------
-# FUNCTIONS TO KEEP TRACK OF HAND STATE
+# HAND OPENNESS
 # -----------------------------------------------------------------------------
 
-def is_finger_extended(lm, tip_idx, pip_idx, wrist_idx=HAND_WRIST):
+def hand_openness(lm):
     """
-    Compares Euclidean distance from wrist to tip vs wrist to PIP.
-    If the tip is further away, the finger is considered extended.
-    Works in normalised image space (x, y) — z is ignored here.
+    Continuous openness score in [0.0, 1.0] based on how far each fingertip
+    is from the wrist relative to its PIP joint. Scale-invariant (pure ratio).
+    Thumb is excluded — it moves laterally and biases the score.
+    Returns (pct, is_open).
     """
-    wrist = np.array([lm[wrist_idx].x, lm[wrist_idx].y])
-    tip   = np.array([lm[tip_idx].x,   lm[tip_idx].y])
-    pip   = np.array([lm[pip_idx].x,   lm[pip_idx].y])
-    return np.linalg.norm(tip - wrist) > np.linalg.norm(pip - wrist)
+    wrist = np.array([lm[HAND_WRIST].x, lm[HAND_WRIST].y])
+    ratios = []
+    for tip_idx, pip_idx in zip(FINGER_TIPS, FINGER_PIPS):
+        tip = np.array([lm[tip_idx].x, lm[tip_idx].y])
+        pip = np.array([lm[pip_idx].x, lm[pip_idx].y])
+        d_tip = np.linalg.norm(tip - wrist)
+        d_pip = np.linalg.norm(pip - wrist)
+        if d_pip < 1e-6:
+            continue
+        ratios.append(d_tip / d_pip)
 
-def is_thumb_extended(lm):
-    """Same logic as is_finger_extended but using the thumb's IP joint."""
-    return is_finger_extended(lm, THUMB_TIP, THUMB_IP)
+    if not ratios:
+        return 0.0, False
 
-def get_hand_state(hand_landmarks):
-    """
-    Checks each finger and returns:
-      state         - "Open" (4-5 up), "Closed" (0-1 up), or "Partial"
-      fingers_up    - list of 5 bools [thumb, index, middle, ring, pinky]
-      extended_count - how many fingers are currently extended
-    """
-    lm = hand_landmarks
-
-    # Check thumb separately, then the four fingers in order
-    fingers_up = [is_thumb_extended(lm)] + [
-        is_finger_extended(lm, tip, pip)
-        for tip, pip in zip(FINGER_TIPS, FINGER_PIPS)
-    ]
-
-    extended_count = sum(fingers_up)
-
-    # Thresholds are intentionally loose to handle borderline cases
-    if extended_count >= 4:
-        state = "Open"
-    elif extended_count <= 1:
-        state = "Closed"
-    else:
-        state = "Partial"
-
-    return state, fingers_up, extended_count
+    avg = sum(ratios) / len(ratios)
+    pct = (avg - OPENNESS_MIN_RATIO) / (OPENNESS_MAX_RATIO - OPENNESS_MIN_RATIO)
+    pct = max(0.0, min(1.0, pct))
+    return pct, pct >= OPEN_THRESHOLD
 
 
 # -----------------------------------------------------------------------------
@@ -323,15 +311,10 @@ while cap.isOpened():
             # is actually the user's right hand, and vice versa — so swap it.
             raw_label = handedness[0].category_name  # "Left" or "Right"
             label = "Right" if raw_label == "Left" else "Left"
-            state, fingers_up, count = get_hand_state(hand_lm)
 
-            # Colour the entire hand skeleton based on open/partial/closed state
-            if state == "Open":
-                color = (0, 255, 0)    # green
-            elif state == "Closed":
-                color = (0, 0, 255)    # red
-            else:
-                color = (0, 165, 255)  # orange
+            pct, is_open = hand_openness(hand_lm)
+            state = "Open" if is_open else "Closed"
+            color = (0, 255, 0) if is_open else (0, 0, 255)
 
             # Draw the 21-landmark hand skeleton
             draw_hand_skeleton(frame, hand_lm, color)
@@ -340,19 +323,9 @@ while cap.isOpened():
             wrist = hand_lm[HAND_WRIST]
             wx, wy = int(wrist.x * w), int(wrist.y * h)
 
-            # Show hand side, state, and how many fingers are up
-            cv2.putText(frame, f"{label}: {state} ({count}/5)",
+            # Show hand side, binary state, and continuous openness percentage
+            cv2.putText(frame, f"{label}: {state} {pct * 100:.2f}%",
                         (wx, wy - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-            # Per-finger breakdown: letter = extended, underscore = curled
-            # Order: Thumb, Index, Middle, Ring, Pinky
-            finger_names = ["T", "I", "M", "R", "P"]
-            breakdown = " ".join(
-                name if up else "_"
-                for name, up in zip(finger_names, fingers_up)
-            )
-            cv2.putText(frame, breakdown, (wx, wy + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
             # Compute wrist bend angle using elbow (from pose) -> wrist -> middle MCP.
             # First, match this hand to the correct pose arm by finding the closest
