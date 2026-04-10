@@ -172,11 +172,11 @@ def build_frame_payload(ts_ms, forearm_elev, wrist_bend,
     """Assemble the JSON payload for one CV frame (see server-control/README.md)."""
     forearm = {"visible": forearm_elev is not None}
     if forearm_elev is not None:
-        forearm["elevation_deg"] = float(forearm_elev)
+        forearm["elevation_deg"] = int(round(forearm_elev / 5.0)) * 5
 
     wrist = {"visible": wrist_bend is not None}
     if wrist_bend is not None:
-        wrist["bend_deg"] = float(wrist_bend)
+        wrist["bend_deg"] = int(round(wrist_bend / 5.0)) * 5
 
     hand = {"visible": hand_side is not None}
     if hand_side is not None:
