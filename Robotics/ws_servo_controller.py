@@ -64,6 +64,10 @@ CV_SHOULDER_MAX = 0.0   # CV elevation at servo -20°
 CV_NEEDLE_MIN = -90.0   # CV wrist bend at servo 15°
 CV_NEEDLE_MAX = 90.0    # CV wrist bend at servo 0°
 
+# ─── Velocity Ramping ────────────────────────────────────────────────────────
+MAX_VELOCITY = 120.0   # degrees/sec — max rate servos ramp toward target
+RAMP_HZ = 50           # servo update loop frequency (50Hz = 20ms per tick)
+
 # ─── Zone Classification Thresholds ──────────────────────────────────────────
 # Percentage of range from the limit at which we enter amber/red zones
 AMBER_THRESHOLD = 0.15   # within 15% of limit
@@ -112,6 +116,12 @@ class ServoController:
         self.yaw = 0.0
         self.pitch = 0.0
         self.needle = 0.0
+
+        # Target angles (set by CV messages, ramped toward by update loop)
+        self.target_yaw = 0.0
+        self.target_pitch = 0.0
+        self.target_needle = 0.0
+
         self.clutch = False
 
         # Stats
@@ -122,31 +132,56 @@ class ServoController:
         self._write_servos()
         print(f"[SERVO] Initialized — Home position (0°, 0°, 0°)")
 
-    def update(self, cv_yaw, cv_pitch, cv_needle, clutch):
-        """Update servo positions from received CV angles."""
+    def set_target(self, cv_yaw, cv_pitch, cv_needle, clutch):
+        """Set target servo positions from CV angles (does not write PWM)."""
         self.clutch = clutch
 
         if clutch:
-            # Hold current position — don't update angles
+            # Hold current position — don't update targets
             return
 
-        # Map CV angles to servo angles
-        yaw = map_range(cv_yaw, CV_BASE_MIN, CV_BASE_MAX,
-                        BASE_ANGLE_MIN, BASE_ANGLE_MAX)
-        pitch = map_range(cv_pitch, CV_SHOULDER_MIN, CV_SHOULDER_MAX,
-                          SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX)
-        needle = map_range(cv_needle, CV_NEEDLE_MIN, CV_NEEDLE_MAX,
-                           NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX)
-
-        # Clamp to safe servo limits
-        self.yaw = clamp(yaw, BASE_ANGLE_MIN, BASE_ANGLE_MAX)
-        self.pitch = clamp(pitch, SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX)
-        self.needle = clamp(needle, NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX)
-
-        self._write_servos()
+        self.target_yaw = clamp(
+            map_range(cv_yaw, CV_BASE_MIN, CV_BASE_MAX,
+                      BASE_ANGLE_MIN, BASE_ANGLE_MAX),
+            BASE_ANGLE_MIN, BASE_ANGLE_MAX)
+        self.target_pitch = clamp(
+            map_range(cv_pitch, CV_SHOULDER_MIN, CV_SHOULDER_MAX,
+                      SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX),
+            SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX)
+        self.target_needle = clamp(
+            map_range(cv_needle, CV_NEEDLE_MIN, CV_NEEDLE_MAX,
+                      NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX),
+            NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX)
 
         self.last_msg_time = time.monotonic()
         self.msg_count += 1
+
+    def ramp_step(self, dt):
+        """Move current angles toward targets at MAX_VELOCITY. Write PWM if changed."""
+        if self.clutch:
+            return
+
+        moved = False
+        for attr, target_attr, lo, hi in [
+            ("yaw", "target_yaw", BASE_ANGLE_MIN, BASE_ANGLE_MAX),
+            ("pitch", "target_pitch", SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX),
+            ("needle", "target_needle", NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX),
+        ]:
+            current = getattr(self, attr)
+            target = getattr(self, target_attr)
+            diff = target - current
+            max_step = MAX_VELOCITY * dt
+            if abs(diff) > max_step:
+                new_val = current + max_step * (1 if diff > 0 else -1)
+            else:
+                new_val = target
+            new_val = clamp(new_val, lo, hi)
+            if new_val != current:
+                setattr(self, attr, new_val)
+                moved = True
+
+        if moved:
+            self._write_servos()
 
     def _write_servos(self):
         """Write current angles to servo PWM signals."""
@@ -205,39 +240,23 @@ async def run(url, status_interval=0.1):
             async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                 print(f"[WS] Connected")
 
-                # Task to send status back to the relay periodically
-                async def send_status():
-                    while True:
-                        try:
-                            status = controller.get_status()
-                            await ws.send(json.dumps(status))
-                        except Exception:
-                            break
-                        await asyncio.sleep(status_interval)
-
-                status_task = asyncio.create_task(send_status())
-
-                try:
+                # Task 1: Receive WS messages, store latest target (fast, non-blocking)
+                async def receive_loop():
                     async for message in ws:
                         try:
                             data = json.loads(message)
                         except json.JSONDecodeError:
                             continue
 
-                        # Parse nested CV JSON:
-                        # {"forearm": {"yaw_deg": ..., "elevation_deg": ...},
-                        #  "wrist": {"bend_deg": ...},
-                        #  "hand": {"is_open": ...}}
                         forearm = data.get("forearm", {})
                         wrist = data.get("wrist", {})
                         hand = data.get("hand", {})
 
-                        cv_yaw = forearm.get("yaw_deg", 0.0)
-                        cv_pitch = forearm.get("elevation_deg", 0.0)
-                        cv_needle = wrist.get("bend_deg", 0.0)
-                        clutch = not hand.get("is_open", True)
-
-                        controller.update(cv_yaw, cv_pitch, cv_needle, clutch)
+                        controller.set_target(
+                            forearm.get("yaw_deg", 0.0),
+                            forearm.get("elevation_deg", 0.0),
+                            wrist.get("bend_deg", 0.0),
+                            not hand.get("is_open", True))
 
                         # Print status every 100 messages
                         if controller.msg_count % 100 == 0:
@@ -250,8 +269,34 @@ async def run(url, status_interval=0.1):
                                 f"needle={controller.needle:+5.1f}° [{zones['angle']:>5s}]  "
                                 f"clutch={'ON' if controller.clutch else 'off'}"
                             )
-                finally:
-                    status_task.cancel()
+
+                # Task 2: 50Hz ramp loop, moves current toward target smoothly
+                async def ramp_loop():
+                    last = time.monotonic()
+                    while True:
+                        now = time.monotonic()
+                        controller.ramp_step(now - last)
+                        last = now
+                        await asyncio.sleep(1.0 / RAMP_HZ)
+
+                # Task 3: Send status back to the relay periodically
+                async def send_status():
+                    while True:
+                        try:
+                            status = controller.get_status()
+                            await ws.send(json.dumps(status))
+                        except Exception:
+                            break
+                        await asyncio.sleep(status_interval)
+
+                try:
+                    await asyncio.gather(
+                        receive_loop(),
+                        ramp_loop(),
+                        send_status(),
+                    )
+                except websockets.ConnectionClosed:
+                    raise  # let outer handler reconnect
 
         except (websockets.ConnectionClosed, ConnectionRefusedError, OSError) as e:
             print(f"[WS] Connection lost: {e}. Reconnecting in 2s...")

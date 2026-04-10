@@ -36,7 +36,7 @@ parser.add_argument("--server_url", type=str,
                     help="server-control ingest websocket URL")
 parser.add_argument("--no_server", action="store_true",
                     help="Disable pushing frames to server-control")
-parser.add_argument("--smoothing_ms", type=int, default=1000,
+parser.add_argument("--smoothing_ms", type=int, default=200,
                     help="Rolling-window length (ms) for smoothing angle/openness signals")
 args = parser.parse_args()
 
