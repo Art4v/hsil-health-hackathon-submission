@@ -58,11 +58,11 @@ NEEDLE_PHYSICAL_MAX = 60.0    # full mechanical range max
 CV_BASE_MIN = 0.0       # CV yaw at servo -80°
 CV_BASE_MAX = -80.0     # CV yaw at servo +80°
 
-CV_SHOULDER_MIN = 90.0  # CV elevation at servo 0°
-CV_SHOULDER_MAX = 0.0   # CV elevation at servo -20°
+CV_SHOULDER_MIN = 0.0   # CV elevation at servo -20°
+CV_SHOULDER_MAX = 90.0  # CV elevation at servo 0°
 
-CV_NEEDLE_MIN = -90.0   # CV wrist bend at servo 15°
-CV_NEEDLE_MAX = 90.0    # CV wrist bend at servo 0°
+CV_NEEDLE_MIN = 90.0    # CV wrist bend at servo 0°
+CV_NEEDLE_MAX = -90.0   # CV wrist bend at servo 15°
 
 # ─── Velocity Ramping ────────────────────────────────────────────────────────
 MAX_VELOCITY = 120.0   # degrees/sec — max rate servos ramp toward target
