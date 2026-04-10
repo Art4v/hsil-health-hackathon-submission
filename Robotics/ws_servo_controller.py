@@ -7,10 +7,12 @@ Run on Raspberry Pi:
   sudo pigpiod
   python3 ws_servo_controller.py --url ws://RELAY_IP:8000/ws/robot
 
-The vision app sends JSON each frame:
-  {"yaw": 15.3, "pitch": -22.7, "angle": 25.0, "clutch": false}
+The vision app sends nested JSON each frame:
+  {"forearm": {"yaw_deg": ..., "elevation_deg": ...},
+   "wrist": {"bend_deg": ...},
+   "hand": {"is_open": true}}
 
-This script writes the angles directly to the servos via pigpio.
+This script maps CV angles to servo angles and writes them via pigpio.
 """
 
 import argparse
@@ -52,6 +54,16 @@ NEEDLE_ANGLE_MAX = 15.0
 NEEDLE_PHYSICAL_MIN = 0.0     # full mechanical range min
 NEEDLE_PHYSICAL_MAX = 60.0    # full mechanical range max
 
+# ─── CV Input Ranges (from computer vision coordinate system) ────────────────
+CV_BASE_MIN = 0.0       # CV yaw at servo -80°
+CV_BASE_MAX = -80.0     # CV yaw at servo +80°
+
+CV_SHOULDER_MIN = 90.0  # CV elevation at servo 0°
+CV_SHOULDER_MAX = 0.0   # CV elevation at servo -20°
+
+CV_NEEDLE_MIN = -90.0   # CV wrist bend at servo 15°
+CV_NEEDLE_MAX = 90.0    # CV wrist bend at servo 0°
+
 # ─── Zone Classification Thresholds ──────────────────────────────────────────
 # Percentage of range from the limit at which we enter amber/red zones
 AMBER_THRESHOLD = 0.15   # within 15% of limit
@@ -66,6 +78,12 @@ def angle_to_pwm(angle, angle_min, angle_max, pwm_min, pwm_max):
 
 def clamp(value, min_val, max_val):
     return max(min_val, min(max_val, value))
+
+
+def map_range(value, in_min, in_max, out_min, out_max):
+    """Linearly map value from [in_min, in_max] to [out_min, out_max]."""
+    ratio = (value - in_min) / (in_max - in_min)
+    return out_min + ratio * (out_max - out_min)
 
 
 def classify_zone(angle, angle_min, angle_max):
@@ -104,17 +122,26 @@ class ServoController:
         self._write_servos()
         print(f"[SERVO] Initialized — Home position (0°, 0°, 0°)")
 
-    def update(self, yaw, pitch, needle_angle, clutch):
-        """Update servo positions from received angles."""
+    def update(self, cv_yaw, cv_pitch, cv_needle, clutch):
+        """Update servo positions from received CV angles."""
         self.clutch = clutch
 
         if clutch:
             # Hold current position — don't update angles
             return
 
+        # Map CV angles to servo angles
+        yaw = map_range(cv_yaw, CV_BASE_MIN, CV_BASE_MAX,
+                        BASE_ANGLE_MIN, BASE_ANGLE_MAX)
+        pitch = map_range(cv_pitch, CV_SHOULDER_MIN, CV_SHOULDER_MAX,
+                          SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX)
+        needle = map_range(cv_needle, CV_NEEDLE_MIN, CV_NEEDLE_MAX,
+                           NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX)
+
+        # Clamp to safe servo limits
         self.yaw = clamp(yaw, BASE_ANGLE_MIN, BASE_ANGLE_MAX)
         self.pitch = clamp(pitch, SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX)
-        self.needle = clamp(needle_angle, NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX)
+        self.needle = clamp(needle, NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX)
 
         self._write_servos()
 
@@ -197,13 +224,20 @@ async def run(url, status_interval=0.1):
                         except json.JSONDecodeError:
                             continue
 
-                        # Expected: {"yaw": float, "pitch": float, "angle": float, "clutch": bool}
-                        yaw = data.get("yaw", 0.0)
-                        pitch = data.get("pitch", 0.0)
-                        needle = data.get("angle", 0.0)
-                        clutch = data.get("clutch", False)
+                        # Parse nested CV JSON:
+                        # {"forearm": {"yaw_deg": ..., "elevation_deg": ...},
+                        #  "wrist": {"bend_deg": ...},
+                        #  "hand": {"is_open": ...}}
+                        forearm = data.get("forearm", {})
+                        wrist = data.get("wrist", {})
+                        hand = data.get("hand", {})
 
-                        controller.update(yaw, pitch, needle, clutch)
+                        cv_yaw = forearm.get("yaw_deg", 0.0)
+                        cv_pitch = forearm.get("elevation_deg", 0.0)
+                        cv_needle = wrist.get("bend_deg", 0.0)
+                        clutch = not hand.get("is_open", True)
+
+                        controller.update(cv_yaw, cv_pitch, cv_needle, clutch)
 
                         # Print status every 100 messages
                         if controller.msg_count % 100 == 0:
