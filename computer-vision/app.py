@@ -85,6 +85,13 @@ MIDDLE_FINGER_MCP = 9
 FINGER_TIPS = [INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP]
 FINGER_PIPS = [INDEX_PIP, MIDDLE_PIP, RING_PIP, PINKY_PIP]
 
+# Forearm yaw: horizontal sweep derived from elbow->wrist x/z. Clamped to the
+# base yaw servo's mechanical range, and EMA-smoothed because monocular depth
+# (MediaPipe .z) is noisy.
+YAW_LIMIT_DEG = 80.0
+YAW_EMA_ALPHA = 0.3
+_forearm_yaw_ema = None
+
 # Hand openness: linear map from avg wrist-tip/wrist-pip ratio → [0, 1].
 # Thumb is deliberately excluded because it moves laterally and biases the score.
 OPENNESS_MIN_RATIO = 0.65   # ratio at which we call it 0%
@@ -167,12 +174,14 @@ def draw_hand_skeleton(frame, hand_landmarks, color):
 # FRAME PAYLOAD + WEBSOCKET SENDER
 # -----------------------------------------------------------------------------
 
-def build_frame_payload(ts_ms, forearm_elev, wrist_bend,
+def build_frame_payload(ts_ms, forearm_elev, forearm_yaw, wrist_bend,
                         hand_side, hand_pct, hand_is_open):
     """Assemble the JSON payload for one CV frame (see server-control/README.md)."""
     forearm = {"visible": forearm_elev is not None}
     if forearm_elev is not None:
         forearm["elevation_deg"] = int(round(forearm_elev / 5.0)) * 5
+    if forearm_yaw is not None:
+        forearm["yaw_deg"] = int(round(forearm_yaw / 5.0)) * 5
 
     wrist = {"visible": wrist_bend is not None}
     if wrist_bend is not None:
@@ -362,6 +371,7 @@ while cap.isOpened():
     # Frame-scope values the payload builder will read after rendering.
     # Stay None if the corresponding signal wasn't visible this frame.
     frame_forearm_elev = None
+    frame_forearm_yaw  = None
     frame_wrist_bend   = None
     frame_hand_side    = None
     frame_hand_pct     = None
@@ -417,10 +427,33 @@ while cap.isOpened():
             forearm_elev = elevation_angle(elbow_px, wrist_px)
             frame_forearm_elev = forearm_elev
 
+            # Forearm yaw — horizontal sweep of the elbow->wrist vector. Uses raw
+            # normalised landmark coords because MediaPipe .z (depth relative to
+            # hip midpoint, negative = closer to camera) is only meaningful in
+            # the normalised space. -dz in atan2 makes 0° = arm pointing at camera.
+            elbow_lm = pose_lm[POSE_IDX[f"{MP_SIDE}_ELBOW"]]
+            wrist_lm = pose_lm[POSE_IDX[f"{MP_SIDE}_WRIST"]]
+            dx = wrist_lm.x - elbow_lm.x
+            dz = wrist_lm.z - elbow_lm.z
+            raw_yaw = np.degrees(np.arctan2(dx, -dz))
+            raw_yaw = max(-YAW_LIMIT_DEG, min(YAW_LIMIT_DEG, raw_yaw))
+
+            if _forearm_yaw_ema is None:
+                _forearm_yaw_ema = raw_yaw
+            else:
+                _forearm_yaw_ema = (
+                    YAW_EMA_ALPHA * raw_yaw
+                    + (1.0 - YAW_EMA_ALPHA) * _forearm_yaw_ema
+                )
+            forearm_yaw = _forearm_yaw_ema
+            frame_forearm_yaw = forearm_yaw
+
             # Display forearm elevation near the elbow joint
             ex, ey = elbow_px
             cv2.putText(frame, f"Elev: {forearm_elev:.1f}deg",
                         (ex + 10, ey + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
+            cv2.putText(frame, f"Yaw: {forearm_yaw:.1f}deg",
+                        (ex + 10, ey + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
 
             # Save wrist position in normalised coords for hand matching below.
             # Key by the MediaPipe side so the elbow lookup in the hand section
@@ -477,6 +510,7 @@ while cap.isOpened():
         payload = build_frame_payload(
             ts_ms=(time.monotonic_ns() - start_ns) // 1_000_000,
             forearm_elev=frame_forearm_elev,
+            forearm_yaw=frame_forearm_yaw,
             wrist_bend=frame_wrist_bend,
             hand_side=frame_hand_side,
             hand_pct=frame_hand_pct,

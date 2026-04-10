@@ -37,6 +37,7 @@ INDEX_HTML = """<!doctype html>
 <h2>Forearm</h2>
 <p>Visible: <span id="forearm_vis">-</span></p>
 <p>Elevation (deg): <span id="forearm_elev">-</span></p>
+<p>Yaw (deg): <span id="forearm_yaw">-</span></p>
 <h2>Wrist</h2>
 <p>Visible: <span id="wrist_vis">-</span></p>
 <p>Bend (deg): <span id="wrist_bend">-</span></p>
@@ -62,6 +63,7 @@ function connect() {
     set("ts", d.ts_ms);
     set("forearm_vis",  d.forearm.visible);
     set("forearm_elev", fmt(d.forearm.elevation_deg));
+    set("forearm_yaw",  fmt(d.forearm.yaw_deg));
     set("wrist_vis",    d.wrist.visible);
     set("wrist_bend",   fmt(d.wrist.bend_deg));
     set("hand_vis",     d.hand.visible);
