@@ -1,6 +1,10 @@
 # Library imports
 import argparse
+import asyncio
+import json
 import os
+import queue
+import threading
 import time
 import urllib.request
 
@@ -24,6 +28,11 @@ parser.add_argument("--min_detection_confidence", type=float, default=0.5,
                     help="Detection confidence threshold")
 parser.add_argument("--min_tracking_confidence", type=float, default=0.5,
                     help="Tracking confidence threshold")
+parser.add_argument("--server_url", type=str,
+                    default="ws://127.0.0.1:8000/ws/ingest",
+                    help="server-control ingest websocket URL")
+parser.add_argument("--no_server", action="store_true",
+                    help="Disable pushing frames to server-control")
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -155,6 +164,125 @@ def draw_hand_skeleton(frame, hand_landmarks, color):
         cv2.circle(frame, p, 3, color, -1)
 
 # -----------------------------------------------------------------------------
+# FRAME PAYLOAD + WEBSOCKET SENDER
+# -----------------------------------------------------------------------------
+
+def build_frame_payload(ts_ms, forearm_elev, wrist_bend,
+                        hand_side, hand_pct, hand_is_open):
+    """Assemble the JSON payload for one CV frame (see server-control/README.md)."""
+    forearm = {"visible": forearm_elev is not None}
+    if forearm_elev is not None:
+        forearm["elevation_deg"] = float(forearm_elev)
+
+    wrist = {"visible": wrist_bend is not None}
+    if wrist_bend is not None:
+        wrist["bend_deg"] = float(wrist_bend)
+
+    hand = {"visible": hand_side is not None}
+    if hand_side is not None:
+        hand["side"] = hand_side
+        hand["openness_pct"] = float(hand_pct)
+        hand["is_open"] = bool(hand_is_open)
+
+    return {
+        "ts_ms": int(ts_ms),
+        "forearm": forearm,
+        "wrist": wrist,
+        "hand": hand,
+    }
+
+
+class FramePusher:
+    """
+    Pushes frame payloads to server-control over a websocket.
+
+    OpenCV's main loop stays synchronous — we run asyncio + the websockets
+    library on a dedicated background thread and communicate through a
+    size-1 queue. If the queue is full we drop the oldest frame: for a live
+    feed, freshness beats completeness.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, url):
+        self.url = url
+        self.q: "queue.Queue" = queue.Queue(maxsize=1)
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def push(self, payload: dict) -> None:
+        # Drop stale frame if the sender hasn't caught up yet.
+        try:
+            self.q.put_nowait(payload)
+        except queue.Full:
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.q.put_nowait(payload)
+            except queue.Full:
+                pass
+
+    def stop(self):
+        try:
+            self.q.put_nowait(self._SENTINEL)
+        except queue.Full:
+            # Replace whatever is queued with the sentinel.
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.q.put_nowait(self._SENTINEL)
+            except queue.Full:
+                pass
+        self.thread.join(timeout=2.0)
+
+    def _run(self):
+        try:
+            asyncio.run(self._sender_loop())
+        except Exception as e:
+            print(f"[server push] sender thread exited: {e}")
+
+    async def _sender_loop(self):
+        # Imported lazily so users running with --no_server don't need the dep.
+        import websockets
+
+        loop = asyncio.get_running_loop()
+
+        while True:
+            try:
+                async with websockets.connect(self.url, max_queue=1) as ws:
+                    print(f"[server push] connected to {self.url}")
+                    while True:
+                        item = await loop.run_in_executor(None, self.q.get)
+                        if item is self._SENTINEL:
+                            return
+                        await ws.send(json.dumps(item))
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                print(f"[server push] connection failed ({e}); retrying in 1s")
+                # Drain any queued frames so we don't send stale data on reconnect.
+                try:
+                    while True:
+                        item = self.q.get_nowait()
+                        if item is self._SENTINEL:
+                            return
+                except queue.Empty:
+                    pass
+                await asyncio.sleep(1.0)
+
+
+pusher = None
+if not args.no_server:
+    pusher = FramePusher(args.server_url)
+    pusher.start()
+
+# -----------------------------------------------------------------------------
 # INITIALISATION OF TASK API LANDMARKERS AND WEBCAM
 # -----------------------------------------------------------------------------
 
@@ -231,6 +359,14 @@ while cap.isOpened():
     pose_wrist_positions = {}
     pose_lm = None  # populated below if a pose was detected
 
+    # Frame-scope values the payload builder will read after rendering.
+    # Stay None if the corresponding signal wasn't visible this frame.
+    frame_forearm_elev = None
+    frame_wrist_bend   = None
+    frame_hand_side    = None
+    frame_hand_pct     = None
+    frame_hand_open    = None
+
     # -----------------------------------------------------------------------------
     # POSE RENDERING
     # -----------------------------------------------------------------------------
@@ -279,6 +415,7 @@ while cap.isOpened():
             # Forearm elevation — how far the forearm is tilted above horizontal
             # Uses elbow->wrist vector vs the table plane (horizontal in image space)
             forearm_elev = elevation_angle(elbow_px, wrist_px)
+            frame_forearm_elev = forearm_elev
 
             # Display forearm elevation near the elbow joint
             ex, ey = elbow_px
@@ -307,6 +444,10 @@ while cap.isOpened():
             pct, is_open = hand_openness(hand_lm)
             state = "Open" if is_open else "Closed"
             color = (0, 255, 0) if is_open else (0, 0, 255)
+
+            frame_hand_side = label
+            frame_hand_pct  = pct
+            frame_hand_open = is_open
 
             # Draw the 21-landmark hand skeleton
             draw_hand_skeleton(frame, hand_lm, color)
@@ -354,9 +495,22 @@ while cap.isOpened():
                 dot   = forearm_vec[0] * hand_vec[0] + forearm_vec[1] * hand_vec[1]
                 deviation_deg = abs(np.degrees(np.arctan2(cross, dot)))
                 wrist_bend = max(0.0, min(180.0, 180.0 - deviation_deg))
+                frame_wrist_bend = wrist_bend
 
                 cv2.putText(frame, f"Wrist bend: {wrist_bend:.1f}deg",
                             (wx, wy + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+
+    # Push this frame's measurements out to server-control (if enabled).
+    if pusher is not None:
+        payload = build_frame_payload(
+            ts_ms=(time.monotonic_ns() - start_ns) // 1_000_000,
+            forearm_elev=frame_forearm_elev,
+            wrist_bend=frame_wrist_bend,
+            hand_side=frame_hand_side,
+            hand_pct=frame_hand_pct,
+            hand_is_open=frame_hand_open,
+        )
+        pusher.push(payload)
 
     cv2.imshow("Pose + Hands Tracking", frame)
 
@@ -369,3 +523,5 @@ cap.release()
 pose_landmarker.close()
 hand_landmarker.close()
 cv2.destroyAllWindows()
+if pusher is not None:
+    pusher.stop()
