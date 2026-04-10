@@ -386,44 +386,13 @@ if not cap.isOpened():
         f"Try a different --device index (0, 1, 2, ...)."
     )
 
-
-# -----------------------------------------------------------------------------
-# THREADED FRAME GRABBER — eliminates camera buffer lag
-# -----------------------------------------------------------------------------
-
-class FrameGrabber:
-    """Continuously grabs frames in a background thread, keeping only the latest."""
-    def __init__(self, cap):
-        self.cap = cap
-        self._frame = None
-        self._ret = False
-        self._lock = threading.Lock()
-        self._thread = threading.Thread(target=self._grab_loop, daemon=True)
-        self._thread.start()
-
-    def _grab_loop(self):
-        while True:
-            ret, frame = self.cap.read()
-            with self._lock:
-                self._ret = ret
-                self._frame = frame
-            if not ret:
-                break
-
-    def read(self):
-        with self._lock:
-            return self._ret, self._frame.copy() if self._frame is not None else None
-
-
-grabber = FrameGrabber(cap)
-
 # -----------------------------------------------------------------------------
 # RUN MODELS WHILE WEBCAM IS RUNNING
 # -----------------------------------------------------------------------------
 start_ns = time.monotonic_ns()
 
 while cap.isOpened():
-    ret, frame = grabber.read()
+    ret, frame = cap.read()
     if not ret:
         break
 

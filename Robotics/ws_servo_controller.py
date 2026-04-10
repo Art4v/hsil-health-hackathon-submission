@@ -44,13 +44,13 @@ NEEDLE_PWM_MAX = 2400
 BASE_ANGLE_MIN = -80.0
 BASE_ANGLE_MAX = 80.0
 
-SHOULDER_ANGLE_MIN = -60.0
+SHOULDER_ANGLE_MIN = -20.0
 SHOULDER_ANGLE_MAX = 0.0
 SHOULDER_PHYSICAL_MIN = -60.0  # full mechanical range min
 SHOULDER_PHYSICAL_MAX = 0.0    # full mechanical range max
 
 NEEDLE_ANGLE_MIN = 0.0
-NEEDLE_ANGLE_MAX = 30.0
+NEEDLE_ANGLE_MAX = 15.0
 NEEDLE_PHYSICAL_MIN = 0.0     # full mechanical range min
 NEEDLE_PHYSICAL_MAX = 60.0    # full mechanical range max
 
@@ -58,11 +58,11 @@ NEEDLE_PHYSICAL_MAX = 60.0    # full mechanical range max
 CV_BASE_MIN = 0.0       # CV yaw at servo -80°
 CV_BASE_MAX = -80.0     # CV yaw at servo +80°
 
-CV_SHOULDER_MIN = 0.0   # CV elevation at servo -60°
+CV_SHOULDER_MIN = 0.0   # CV elevation at servo -20°
 CV_SHOULDER_MAX = 90.0  # CV elevation at servo 0°
 
 CV_NEEDLE_MIN = 90.0    # CV wrist bend at servo 0°
-CV_NEEDLE_MAX = -90.0   # CV wrist bend at servo 30°
+CV_NEEDLE_MAX = -90.0   # CV wrist bend at servo 15°
 
 # ─── Velocity Ramping ────────────────────────────────────────────────────────
 MAX_VELOCITY = 120.0   # degrees/sec — max rate servos ramp toward target
@@ -242,14 +242,7 @@ async def run(url, status_interval=0.1):
 
                 # Task 1: Receive WS messages, store latest target (fast, non-blocking)
                 async def receive_loop():
-                    while True:
-                        message = await ws.recv()
-                        # Drain buffered messages — keep only the latest
-                        while True:
-                            try:
-                                message = await asyncio.wait_for(ws.recv(), timeout=0)
-                            except (asyncio.TimeoutError, asyncio.CancelledError):
-                                break
+                    async for message in ws:
                         try:
                             data = json.loads(message)
                         except json.JSONDecodeError:
