@@ -460,45 +460,17 @@ while cap.isOpened():
             cv2.putText(frame, f"{label}: {state} {pct * 100:.2f}%",
                         (wx, wy - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            # Compute wrist bend angle using elbow (from pose) -> wrist -> middle MCP.
-            # First, match this hand to the correct pose arm by finding the closest
-            # pose wrist to the hand's wrist landmark (in normalised coords)
-            if pose_wrist_positions and pose_lm is not None:
-                hand_wrist_norm = np.array([wrist.x, wrist.y])
-                closest_side = min(
-                    pose_wrist_positions,
-                    key=lambda s: np.linalg.norm(
-                        hand_wrist_norm - np.array(pose_wrist_positions[s])
-                    )
-                )
+            # Wrist angle relative to horizontal: elevation of the hand vector
+            # (wrist -> middle-finger MCP) in image space. 0° = flat, ±90° = vertical.
+            mid_mcp = hand_lm[MIDDLE_FINGER_MCP]
+            mid_mcp_px = (int(mid_mcp.x * w), int(mid_mcp.y * h))
+            wrist_px = (wx, wy)
 
-                elbow_idx = POSE_IDX[f"{closest_side}_ELBOW"]
+            wrist_bend = elevation_angle(wrist_px, mid_mcp_px)
+            frame_wrist_bend = wrist_bend
 
-                # Convert pose elbow to pixels
-                elbow_px = (
-                    int(pose_lm[elbow_idx].x * w),
-                    int(pose_lm[elbow_idx].y * h)
-                )
-                wrist_px = (wx, wy)
-
-                # Middle finger MCP = base knuckle of middle finger
-                # Acts as a proxy for the direction of the hand beyond the wrist
-                mid_mcp = hand_lm[MIDDLE_FINGER_MCP]
-                mid_mcp_px = (int(mid_mcp.x * w), int(mid_mcp.y * h))
-
-                # Wrist bend via signed deviation of hand direction from forearm direction.
-                # atan2(cross, dot) gives 0° when straight, ±90° when fully bent.
-                # We remap: 0° deviation → 180° displayed, 90° deviation → 90° displayed.
-                forearm_vec = np.array(wrist_px, dtype=float) - np.array(elbow_px, dtype=float)
-                hand_vec    = np.array(mid_mcp_px, dtype=float) - np.array(wrist_px, dtype=float)
-                cross = forearm_vec[0] * hand_vec[1] - forearm_vec[1] * hand_vec[0]
-                dot   = forearm_vec[0] * hand_vec[0] + forearm_vec[1] * hand_vec[1]
-                deviation_deg = abs(np.degrees(np.arctan2(cross, dot)))
-                wrist_bend = max(0.0, min(180.0, 180.0 - deviation_deg))
-                frame_wrist_bend = wrist_bend
-
-                cv2.putText(frame, f"Wrist bend: {wrist_bend:.1f}deg",
-                            (wx, wy + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+            cv2.putText(frame, f"Wrist angle: {wrist_bend:.1f}deg",
+                        (wx, wy + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
 
     # Push this frame's measurements out to server-control (if enabled).
     if pusher is not None:
