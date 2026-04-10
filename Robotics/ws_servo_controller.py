@@ -5,7 +5,7 @@ Receives pre-computed servo angles from the relay server and drives the servos.
 
 Run on Raspberry Pi:
   sudo pigpiod
-  python3 ws_servo_controller.py --url ws://RELAY_IP:8000/ws/robot
+  python3 ws_servo_controller.py --url ws://RELAY_IP:8000/ws/stream
 
 The vision app sends nested JSON each frame:
   {"forearm": {"yaw_deg": ..., "elevation_deg": ...},
@@ -272,8 +272,8 @@ async def shutdown(controller):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WebSocket servo controller")
     parser.add_argument(
-        "--url", type=str, required=True,
-        help="WebSocket URL of the relay server (e.g. ws://localhost:8000/ws/robot)"
+        "--url", type=str, default="ws://127.0.0.1:8000/ws/stream",
+        help="WebSocket URL of the relay server (e.g. ws://localhost:8000/ws/stream)"
     )
     parser.add_argument(
         "--status-interval", type=float, default=0.1,
