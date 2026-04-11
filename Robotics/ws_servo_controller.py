@@ -304,7 +304,7 @@ async def run(url, status_interval=0.1):
                             await ws.send(json.dumps(status))
                         except Exception:
                             break
-                        await asyncio.sleep(status_interval)
+                        await asyncio.sleep(2.0)
 
                 try:
                     await asyncio.gather(
