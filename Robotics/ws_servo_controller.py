@@ -133,25 +133,32 @@ class ServoController:
         print(f"[SERVO] Initialized — Home position (0°, 0°, 0°)")
 
     def set_target(self, cv_yaw, cv_pitch, cv_needle, clutch):
-        """Set target servo positions from CV angles (does not write PWM)."""
+        """Set target servo positions from CV angles (does not write PWM).
+
+        Any argument that is None is skipped — the servo holds its previous
+        target.  This prevents slamming to limits when a joint is not visible.
+        """
         self.clutch = clutch
 
         if clutch:
             # Hold current position — don't update targets
             return
 
-        self.target_yaw = clamp(
-            map_range(cv_yaw, CV_BASE_MIN, CV_BASE_MAX,
-                      BASE_ANGLE_MIN, BASE_ANGLE_MAX),
-            BASE_ANGLE_MIN, BASE_ANGLE_MAX)
-        self.target_pitch = clamp(
-            map_range(cv_pitch, CV_SHOULDER_MIN, CV_SHOULDER_MAX,
-                      SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX),
-            SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX)
-        self.target_needle = clamp(
-            map_range(cv_needle, CV_NEEDLE_MIN, CV_NEEDLE_MAX,
-                      NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX),
-            NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX)
+        if cv_yaw is not None:
+            self.target_yaw = clamp(
+                map_range(cv_yaw, CV_BASE_MIN, CV_BASE_MAX,
+                          BASE_ANGLE_MIN, BASE_ANGLE_MAX),
+                BASE_ANGLE_MIN, BASE_ANGLE_MAX)
+        if cv_pitch is not None:
+            self.target_pitch = clamp(
+                map_range(cv_pitch, CV_SHOULDER_MIN, CV_SHOULDER_MAX,
+                          SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX),
+                SHOULDER_ANGLE_MIN, SHOULDER_ANGLE_MAX)
+        if cv_needle is not None:
+            self.target_needle = clamp(
+                map_range(cv_needle, CV_NEEDLE_MIN, CV_NEEDLE_MAX,
+                          NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX),
+                NEEDLE_ANGLE_MIN, NEEDLE_ANGLE_MAX)
 
         self.last_msg_time = time.monotonic()
         self.msg_count += 1
@@ -259,11 +266,14 @@ async def run(url, status_interval=0.1):
                         wrist = data.get("wrist", {})
                         hand = data.get("hand", {})
 
-                        controller.set_target(
-                            forearm.get("yaw_deg", 0.0),
-                            forearm.get("elevation_deg", 0.0),
-                            wrist.get("bend_deg", 0.0),
-                            not hand.get("is_open", True))
+                        # Only extract angles when the joint is visible.
+                        # None → set_target holds the previous target.
+                        cv_yaw = forearm.get("yaw_deg") if forearm.get("visible") else None
+                        cv_pitch = forearm.get("elevation_deg") if forearm.get("visible") else None
+                        cv_needle = wrist.get("bend_deg") if wrist.get("visible") else None
+                        clutch = not hand.get("is_open", True)
+
+                        controller.set_target(cv_yaw, cv_pitch, cv_needle, clutch)
 
                         # Print status every 100 messages
                         if controller.msg_count % 100 == 0:
